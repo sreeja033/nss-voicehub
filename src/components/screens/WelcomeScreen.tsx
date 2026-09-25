@@ -33,6 +33,7 @@ export const WelcomeScreen: React.FC = () => {
     isAdminLoggedIn,
     provisionedVolunteers,
     volunteerRoster,
+    currentVolunteer,
   } = useApp();
 
   // === REAL DATA QUERIES ===
@@ -53,14 +54,105 @@ export const WelcomeScreen: React.FC = () => {
   // Section 2: Solved problems (strictly solved status)
   const solvedProblems: Problem[] = problems.filter((p) => p.status === 'SOLVED');
 
-  // Dynamic counts for Stats section
-  const solvedCount = solvedProblems.length > 0 ? solvedProblems.length : 38;
-  const volunteerCount =
-    (provisionedVolunteers?.length ?? 0) > 0
-      ? provisionedVolunteers.length
-      : (volunteerRoster?.length ?? 0) > 0
-      ? volunteerRoster.length
-      : 25;
+  // Dynamic Real-Time Stats (computed strictly from live application state)
+  const solvedCount = solvedProblems.length;
+
+  // Active volunteers: strictly count active NSS collegiate volunteers in the roster/system
+  const activeCadre = (provisionedVolunteers || []).filter((v) => v.status === 'ACTIVE');
+  const isCurrentVolunteerActive =
+    isVolunteerLoggedIn &&
+    Boolean(currentVolunteer?.id || currentVolunteer?.name) &&
+    !(provisionedVolunteers || []).some(
+      (v) => v.id === currentVolunteer?.id || (v.email && v.email === currentVolunteer?.email)
+    );
+  const volunteerCount = activeCadre.length + (isCurrentVolunteerActive ? 1 : 0);
+
+  // Verified Reports Percentage (strictly calculated from legitimate, unflagged, approved community notices)
+  const totalReports = problems.length;
+  const verifiedReports = problems.filter(
+    (p) =>
+      p.isApproved !== false &&
+      p.moderationStatus !== 'REJECTED' &&
+      p.status !== 'REJECTED' &&
+      !p.aiPhotoFlagged &&
+      (p.flagCount ?? 0) === 0 &&
+      !p.flaggedReason
+  );
+  const verifiedPercentage =
+    totalReports > 0 ? `${Math.round((verifiedReports.length / totalReports) * 100)}%` : '100%';
+
+  // Average Response Time: calculated lively from elapsed time between report creation and volunteer triage/response
+  const respondedProblems = problems.filter((p) => {
+    return (
+      p.status === 'IN_PROGRESS' ||
+      p.status === 'SOLVED' ||
+      Boolean(p.assignedLead) ||
+      Boolean(p.assignedToVolunteerId) ||
+      Boolean(p.assignedSquad) ||
+      (p.updates && p.updates.length > 0)
+    );
+  });
+
+  let avgResponseText = '< 24 hrs';
+  if (respondedProblems.length > 0) {
+    let totalHours = 0;
+    let validCount = 0;
+
+    respondedProblems.forEach((p) => {
+      const createdTime = new Date(p.createdAt).getTime();
+      if (!isNaN(createdTime)) {
+        let firstActionTime: number | null = null;
+        if (p.updates && p.updates.length > 0) {
+          const updateTime = new Date(p.updates[0].timestamp).getTime();
+          if (!isNaN(updateTime) && updateTime >= createdTime) {
+            firstActionTime = updateTime;
+          }
+        }
+        if (!firstActionTime && (p.resolvedAt || p.resolved_at)) {
+          const resTime = new Date(p.resolvedAt || p.resolved_at || '').getTime();
+          if (!isNaN(resTime) && resTime >= createdTime) {
+            firstActionTime = resTime;
+          }
+        }
+        if (!firstActionTime) {
+          const elapsed = Math.max(0.5, (Date.now() - createdTime) / (1000 * 3600));
+          totalHours += elapsed;
+          validCount++;
+          return;
+        }
+
+        const diffHours = Math.max(0.5, (firstActionTime - createdTime) / (1000 * 3600));
+        totalHours += diffHours;
+        validCount++;
+      }
+    });
+
+    if (validCount > 0) {
+      const avg = totalHours / validCount;
+      if (avg < 1) {
+        const mins = Math.max(10, Math.round(avg * 60));
+        avgResponseText = `${mins} mins`;
+      } else if (avg < 24) {
+        const hrs = Math.max(1, Math.round(avg));
+        avgResponseText = `${hrs} hr${hrs === 1 ? '' : 's'}`;
+      } else {
+        const days = Math.round(avg / 24);
+        avgResponseText = `${days * 24} hrs`;
+      }
+    }
+  } else if (totalReports > 0) {
+    // Reports exist but awaiting first squad response
+    const validTimestamps = problems
+      .map((p) => new Date(p.createdAt).getTime())
+      .filter((t) => !isNaN(t));
+    if (validTimestamps.length > 0) {
+      const oldestTime = Math.min(...validTimestamps);
+      const pendingHours = Math.max(1, Math.round((Date.now() - oldestTime) / (1000 * 3600)));
+      avgResponseText = pendingHours < 24 ? `< ${pendingHours + 1} hrs` : `${pendingHours} hrs`;
+    } else {
+      avgResponseText = '< 24 hrs';
+    }
+  }
 
   const handleGetStartedClick = () => {
     navigateTo('role-split');
@@ -375,14 +467,14 @@ export const WelcomeScreen: React.FC = () => {
               </div>
             </div>
 
-            {/* Stat Card 3: 100% Verified Reports */}
+            {/* Stat Card 3: Verified Reports */}
             <div className="bg-[#FFFDF8] rounded-2xl p-5 border border-[#DEC0B8]/60 shadow-xs flex items-center gap-4 hover:-translate-y-0.5 hover:shadow-md transition-all duration-200">
               <div className="w-12 h-12 rounded-full bg-[#B8EADE] flex items-center justify-center text-[#1B4B43] shrink-0">
                 <ShieldCheck className="w-6 h-6 stroke-[2.2]" />
               </div>
               <div>
                 <div className="font-['Epilogue'] font-black text-2xl sm:text-3xl text-[#1B4B43] tracking-tight leading-none">
-                  100%
+                  {verifiedPercentage}
                 </div>
                 <div className="font-['Epilogue'] font-bold text-xs uppercase tracking-wider text-[#1F1B17] mt-1">
                   Verified Reports
@@ -400,7 +492,7 @@ export const WelcomeScreen: React.FC = () => {
               </div>
               <div>
                 <div className="font-['Epilogue'] font-black text-2xl sm:text-3xl text-[#1F1B17] tracking-tight leading-none">
-                  48 hrs
+                  {avgResponseText}
                 </div>
                 <div className="font-['Epilogue'] font-bold text-xs uppercase tracking-wider text-[#1F1B17] mt-1">
                   Average Response
