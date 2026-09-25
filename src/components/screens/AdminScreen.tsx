@@ -171,13 +171,13 @@ export const AdminScreen: React.FC = () => {
     const volunteer = provisionedVolunteers.find((v) => v.id === selectedVolunteerId);
     if (!volunteer) return;
 
-    assignProblemToVolunteer(assigningProblem.id, {
+   assignProblemToVolunteer(assigningProblem.id, {
       leadVolunteerId: volunteer.id,
       leadVolunteerName: volunteer.name,
       squadName: volunteer.unit,
-      targetDate: targetDate || 'Within 48 hours',
-      materialsNeeded: materialsNeeded || 'Standard kit',
-      coordinatorName: 'Dr. R. Verma',
+      targetDate: targetDate || "Within 48 hours",
+      materialsNeeded: materialsNeeded || "Standard kit",
+      coordinatorName: "Dr. R. Verma",
     });
 
     setAssigningProblem(null);
