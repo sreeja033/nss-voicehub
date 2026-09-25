@@ -911,13 +911,13 @@ export const WelcomeScreen: React.FC = () => {
                   <span>coordinator@nss.org</span>
                 </a>
                 <a
-                  href="https://instagram.com"
+                  href="https://www.instagram.com/cmrit.nss?stkn=MWN4dnNpYTlwMDBxZA=="
                   target="_blank"
                   rel="noreferrer"
                   className="inline-flex items-center gap-1.5 hover:text-[#A03818] transition-colors"
                 >
                   <Instagram className="w-3.5 h-3.5 text-[#A03818]" />
-                  <span>@nss_voice</span>
+                  <span>@cmrit.nss</span>
                 </a>
               </div>
             </div>
