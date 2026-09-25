@@ -1,0 +1,818 @@
+import { supabase, isSupabaseConfigured } from './supabase';
+export { supabase, isSupabaseConfigured };
+import { Problem, ProblemCategory, ProblemStatus, ProgressUpdate, ProvisionedVolunteer, VolunteerRosterMember } from '../types';
+
+// Map UI category to DB enum
+export function toDbCategory(category: string): 'garbage' | 'water' | 'streetlights' | 'roads' | 'greenery' | 'school' | 'accessibility' | 'other' {
+  const lower = (category || '').toLowerCase().trim();
+  if (lower.includes('garb') || lower.includes('trash') || lower.includes('sanitat')) return 'garbage';
+  if (lower.includes('water')) return 'water';
+  if (lower.includes('light') || lower.includes('electr')) return 'streetlights';
+  if (lower.includes('road') || lower.includes('pothol')) return 'roads';
+  if (lower.includes('green') || lower.includes('tree') || lower.includes('park')) return 'greenery';
+  if (lower.includes('school')) return 'school';
+  if (lower.includes('access')) return 'accessibility';
+  return 'other';
+}
+
+// Map DB category to UI display
+export function toUiCategory(dbCategory: string): ProblemCategory {
+  switch (dbCategory) {
+    case 'garbage': return 'Garbage';
+    case 'water': return 'Water';
+    case 'streetlights': return 'Streetlights';
+    case 'roads': return 'Roads';
+    case 'greenery': return 'Greenery';
+    case 'school': return 'School';
+    case 'accessibility': return 'Accessibility';
+    default: return 'Other';
+  }
+}
+
+// Map DB status to UI status
+export function toUiStatus(dbStatus: string): ProblemStatus {
+  switch (dbStatus) {
+    case 'pending_review': return 'PENDING_REVIEW';
+    case 'in_progress': return 'IN_PROGRESS';
+    case 'solved': return 'SOLVED';
+    default: return 'REPORTED';
+  }
+}
+
+// Map UI status to DB status
+export function toDbStatus(uiStatus: ProblemStatus): 'pending_review' | 'reported' | 'in_progress' | 'solved' | 'rejected' {
+  switch (uiStatus) {
+    case 'PENDING_REVIEW': return 'pending_review';
+    case 'IN_PROGRESS': return 'in_progress';
+    case 'SOLVED': return 'solved';
+    default: return 'reported';
+  }
+}
+
+/**
+ * Upload an image file to Supabase Storage `report-photos` bucket
+ */
+export async function uploadReportPhoto(file: File | Blob, prefix = 'reports'): Promise<{ url: string | null; error: string | null }> {
+  if (!isSupabaseConfigured()) {
+    return { url: null, error: 'Supabase is not configured' };
+  }
+
+  // Validate type
+  const allowedMime = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+  if (file.type && !allowedMime.includes(file.type)) {
+    return { url: null, error: 'Only image files (JPEG, PNG, WebP, GIF) are allowed.' };
+  }
+
+  // Validate size (max 10MB)
+  if (file.size > 10 * 1024 * 1024) {
+    return { url: null, error: 'Image size exceeds the 10MB limit.' };
+  }
+
+  const fileExt = file.type ? file.type.split('/')[1] || 'jpg' : 'jpg';
+  const fileName = `${prefix}/${Date.now()}_${Math.random().toString(36).substring(2, 9)}.${fileExt}`;
+
+  try {
+    const { data, error } = await supabase.storage
+      .from('report-photos')
+      .upload(fileName, file, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: file.type || 'image/jpeg',
+      });
+
+    if (error) {
+      return { url: null, error: error.message };
+    }
+
+    const { data: publicUrlData } = supabase.storage
+      .from('report-photos')
+      .getPublicUrl(fileName);
+
+    return { url: publicUrlData.publicUrl, error: null };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { url: null, error: msg };
+  }
+}
+
+function isUuid(str?: string | null): boolean {
+  if (!str) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str);
+}
+
+/**
+ * Fetch all problems from Supabase, or local persistent API fallback
+ */
+export async function fetchAllProblems(): Promise<{ data: Problem[]; error: string | null }> {
+  if (!isSupabaseConfigured()) {
+    try {
+      const res = await fetch('/api/problems');
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.problems) && json.problems.length > 0) {
+          return { data: json.problems, error: null };
+        }
+      }
+    } catch {}
+    return { data: [], error: null };
+  }
+
+  try {
+    // 1. Fetch problems
+    const { data: rawProblems, error: probError } = await supabase
+      .from('problems')
+      .select(`
+        *,
+        teams (
+          id,
+          assigned_by,
+          team_members (
+            volunteer_id,
+            role,
+            volunteers (
+              id,
+              name,
+              volunteer_id,
+              college_unit
+            )
+          )
+        ),
+        actions (
+          id,
+          description,
+          photo_url,
+          photo_type,
+          logged_by,
+          created_at,
+          volunteers (
+            name,
+            volunteer_id
+          )
+        ),
+        upvotes (
+          id,
+          session_token,
+          community_user_id
+        ),
+        adoptions (
+          id,
+          session_token,
+          community_user_id
+        )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (probError) {
+      console.error('Error fetching problems:', probError);
+      return { data: [], error: probError.message };
+    }
+
+    const mapped: Problem[] = (rawProblems || []).map((p: any) => {
+      // Find assigned team & lead volunteer
+      const primaryTeam = p.teams && p.teams.length > 0 ? p.teams[0] : null;
+      let leadName: string | undefined = undefined;
+      let leadVolId: string | undefined = undefined;
+      const assignedVolunteerNames: string[] = [];
+
+      if (primaryTeam && primaryTeam.team_members) {
+        for (const tm of primaryTeam.team_members) {
+          if (tm.volunteers) {
+            assignedVolunteerNames.push(tm.volunteers.name);
+            if (tm.role === 'leader' || !leadName) {
+              leadName = tm.volunteers.name;
+              leadVolId = tm.volunteers.volunteer_id;
+            }
+          }
+        }
+      }
+
+      // Map actions to ProgressUpdate
+      const updates: ProgressUpdate[] = (p.actions || []).map((a: any) => ({
+        id: a.id,
+        author: a.volunteers?.name || 'NSS Volunteer Cadre',
+        role: 'NSS Cadet',
+        timestamp: new Date(a.created_at).toLocaleString(),
+        description: a.description,
+        photoUrl: a.photo_url || undefined,
+        tag: a.photo_type === 'before' ? 'BEFORE EVIDENCE' : a.photo_type === 'after' ? 'RESOLUTION PROOF' : 'WORK IN PROGRESS',
+      }));
+
+      // Find before / after photos from actions
+      const beforeAction = (p.actions || []).find((a: any) => a.photo_type === 'before');
+      const afterAction = (p.actions || []).find((a: any) => a.photo_type === 'after');
+
+      return {
+        id: p.id,
+        title: p.title,
+        description: p.description,
+        category: toUiCategory(p.category),
+        status: toUiStatus(p.status),
+        moderationStatus: p.status === 'pending_review' ? ('PENDING' as const) : ('APPROVED' as const),
+        isApproved: p.status !== 'pending_review',
+        imageHash: p.image_hash || undefined,
+        possibleReusedPhoto: Boolean(p.possible_reused_photo),
+        aiPhotoMatchResult: p.ai_photo_match_result || undefined,
+        aiPhotoFlagged: Boolean(p.ai_photo_flagged),
+        aiPhotoRawResponse: p.ai_photo_raw_response || undefined,
+        reflaggedByCommunity: Boolean(p.reflagged_by_community),
+        flagCount: p.flag_count || 0,
+        location: p.location_text,
+        landmark: p.landmark || undefined,
+        coordinates: p.lat && p.lng ? { lat: Number(p.lat), lng: Number(p.lng) } : undefined,
+        createdAt: new Date(p.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }),
+        urgent: Boolean(p.is_urgent),
+        anonymous: !p.reported_by_user_id,
+        reportedByUserId: p.reported_by_user_id || undefined,
+        photoUrl: p.photo_url || undefined,
+        beforePhotoUrl: beforeAction?.photo_url || p.photo_url || undefined,
+        solvedPhotoUrl: afterAction?.photo_url || undefined,
+        upvotes: p.upvote_count || (p.upvotes?.length ?? 0),
+        adoptersCount: p.adoptions?.length ?? 0,
+        assignedSquad: primaryTeam ? 'NSS Civic Cadre' : undefined,
+        assignedLead: leadName,
+        assignedVolunteers: assignedVolunteerNames.length > 0 ? assignedVolunteerNames : undefined,
+        assignedToVolunteerId: leadVolId,
+        assignedBy: primaryTeam?.assigned_by || null,
+        assignmentStatus: primaryTeam ? 'ACCEPTED' : 'PENDING',
+        updates,
+        comments: [],
+        linkedDuplicatesCount: p.linked_reports_count || 0,
+      };
+    });
+
+    return { data: mapped, error: null };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { data: [], error: msg };
+  }
+}
+
+/**
+ * Report a new problem or detect duplicate at database level
+ */
+export async function createProblemInDb(params: {
+  title: string;
+  description: string;
+  category: ProblemCategory;
+  location: string;
+  landmark?: string;
+  coordinates?: { lat: number; lng: number };
+  urgent: boolean;
+  anonymous: boolean;
+  photoUrl?: string;
+  imageHash?: string;
+  possibleReusedPhoto?: boolean;
+  aiPhotoMatchResult?: 'MATCH' | 'MISMATCH' | 'UNCLEAR';
+  aiPhotoFlagged?: boolean;
+  aiPhotoRawResponse?: string;
+  reportedByUserId?: string | null;
+  sessionToken?: string;
+}): Promise<{ success: boolean; duplicateLinked: boolean; problemId: string; error?: string }> {
+  try {
+    const dbCategory = toDbCategory(params.category);
+
+    // Step 6: Database-level duplicate detection
+    const { data: dupId, error: rpcErr } = await supabase.rpc('detect_and_link_duplicate', {
+      p_title: params.title.trim(),
+      p_description: params.description.trim(),
+      p_category: dbCategory,
+      p_location_text: params.location.trim(),
+    });
+
+    if (!rpcErr && dupId) {
+      return {
+        success: true,
+        duplicateLinked: true,
+        problemId: String(dupId),
+      };
+    }
+
+    // Insert new problem row - default status is 'pending_review'
+    const { data: newProb, error: insertErr } = await supabase
+      .from('problems')
+      .insert({
+        title: params.title.trim(),
+        description: params.description.trim(),
+        category: dbCategory,
+        location_text: params.location.trim(),
+        landmark: params.landmark?.trim() || null,
+        lat: params.coordinates?.lat ?? null,
+        lng: params.coordinates?.lng ?? null,
+        is_urgent: Boolean(params.urgent),
+        photo_url: params.photoUrl || null,
+        image_hash: params.imageHash || null,
+        possible_reused_photo: Boolean(params.possibleReusedPhoto),
+        reported_by_user_id: params.anonymous ? null : params.reportedByUserId || null,
+        session_token: params.sessionToken || null,
+        status: 'pending_review',
+      })
+      .select('id')
+      .single();
+
+    if (insertErr || !newProb) {
+      return {
+        success: false,
+        duplicateLinked: false,
+        problemId: '',
+        error: insertErr?.message || 'Failed to submit problem report.',
+      };
+    }
+
+    // If a photo was supplied, also record it as an initial 'before' action
+    if (params.photoUrl) {
+      await supabase.from('actions').insert({
+        problem_id: newProb.id,
+        description: 'Initial photographic evidence submitted with civic report.',
+        photo_url: params.photoUrl,
+        photo_type: 'before',
+      });
+    }
+
+    return {
+      success: true,
+      duplicateLinked: false,
+      problemId: newProb.id,
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, duplicateLinked: false, problemId: '', error: msg };
+  }
+}
+
+/**
+ * Approve a problem in DB (move from pending_review to reported)
+ */
+export async function approveProblemInDb(problemId: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    if (!isSupabaseConfigured()) {
+      try {
+        const res = await fetch(`/api/problems/${encodeURIComponent(problemId)}/approve`, {
+          method: 'POST',
+        });
+        if (res.ok) return { success: true };
+      } catch {}
+      return { success: true };
+    }
+
+    const { error } = await supabase
+      .from('problems')
+      .update({
+        status: 'reported',
+        reflagged_by_community: false,
+        flag_count: 0,
+      })
+      .eq('id', problemId);
+
+    if (error) return { success: false, error: error.message };
+
+    // Mirror to local API
+    try {
+      await fetch(`/api/problems/${encodeURIComponent(problemId)}/approve`, { method: 'POST' });
+    } catch {}
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
+/**
+ * Reject / remove spam in DB
+ */
+export async function rejectProblemInDb(problemId: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { error } = await supabase
+      .from('problems')
+      .update({ status: 'rejected' })
+      .eq('id', problemId);
+
+    if (error) return { success: false, error: error.message };
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
+/**
+ * Flag a problem for community moderation review
+ */
+export async function flagProblemInDb(params: {
+  problemId: string;
+  sessionToken?: string;
+  userId?: string | null;
+  reason?: string;
+}): Promise<{ success: boolean; flagCount: number; reflaggedToPending: boolean; error?: string }> {
+  try {
+    // Record flag in problem_flags
+    await supabase.from('problem_flags').insert({
+      problem_id: params.problemId,
+      session_token: params.sessionToken || null,
+      community_user_id: params.userId || null,
+      reason: params.reason || 'Flagged by community member',
+    });
+
+    const { data: prob } = await supabase
+      .from('problems')
+      .select('flag_count, status')
+      .eq('id', params.problemId)
+      .single();
+
+    const currentCount = (prob?.flag_count || 0) + 1;
+    const shouldReflag = currentCount >= 3;
+
+    await supabase
+      .from('problems')
+      .update({
+        flag_count: currentCount,
+        reflagged_by_community: shouldReflag,
+        ...(shouldReflag ? { status: 'pending_review' } : {}),
+      })
+      .eq('id', params.problemId);
+
+    return { success: true, flagCount: currentCount, reflaggedToPending: shouldReflag };
+  } catch (err: unknown) {
+    return { success: false, flagCount: 1, reflaggedToPending: false, error: String(err) };
+  }
+}
+
+/**
+ * Helper to resolve volunteer UUID from volunteer ID string
+ */
+async function resolveVolunteerUuid(idOrCode?: string | null): Promise<string | null> {
+  if (!idOrCode) return null;
+  if (isUuid(idOrCode)) return idOrCode;
+  try {
+    const { data } = await supabase
+      .from('volunteers')
+      .select('id')
+      .ilike('volunteer_id', idOrCode.trim())
+      .maybeSingle();
+    return data?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Assign a problem to a volunteer team (Coordinator action)
+ */
+export async function assignProblemInDb(params: {
+  problemId: string;
+  volunteerId: string; // auth uuid or volunteer code
+  volunteerName?: string;
+  coordinatorId?: string;
+  coordinatorName?: string;
+  squadName?: string;
+  targetDate?: string;
+  materialsNeeded?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    if (!isSupabaseConfigured()) {
+      try {
+        const res = await fetch(`/api/problems/${encodeURIComponent(params.problemId)}/assign`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        });
+        if (res.ok) return { success: true };
+      } catch {}
+      return { success: true };
+    }
+
+    const volUuid = await resolveVolunteerUuid(params.volunteerId);
+    const coordUuid = isUuid(params.coordinatorId) ? params.coordinatorId : null;
+
+    // 1. Create team
+    const { data: team, error: teamErr } = await supabase
+      .from('teams')
+      .insert({
+        problem_id: params.problemId,
+        assigned_by: coordUuid,
+      })
+      .select('id')
+      .single();
+
+    if (teamErr || !team) {
+      return { success: false, error: teamErr?.message || 'Failed to create team assignment.' };
+    }
+
+    // 2. Add team member if UUID resolved
+    if (volUuid) {
+      const { error: tmErr } = await supabase
+        .from('team_members')
+        .insert({
+          team_id: team.id,
+          volunteer_id: volUuid,
+          role: 'leader',
+        });
+
+      if (tmErr) {
+        console.warn('team_members insert warning:', tmErr.message);
+      }
+    }
+
+    // Explicitly update problem status to 'in_progress' to guarantee update even if DB trigger is delayed
+    await supabase
+      .from('problems')
+      .update({ status: 'in_progress' })
+      .eq('id', params.problemId);
+
+    // Mirror to local API
+    try {
+      await fetch(`/api/problems/${encodeURIComponent(params.problemId)}/assign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+    } catch {}
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
+/**
+ * Self-claim an unassigned problem (Volunteer action)
+ */
+export async function selfClaimProblemInDb(params: {
+  problemId: string;
+  volunteerId: string;
+}): Promise<{ success: boolean; error?: string }> {
+  return assignProblemInDb({
+    problemId: params.problemId,
+    volunteerId: params.volunteerId,
+  });
+}
+
+/**
+ * Log an action / progress update (Volunteer action)
+ */
+export async function logActionInDb(params: {
+  problemId: string;
+  description: string;
+  photoUrl: string;
+  photoType: 'before' | 'after' | 'progress';
+  volunteerId?: string | null;
+  volunteerName?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    if (!isSupabaseConfigured()) {
+      try {
+        const res = await fetch(`/api/problems/${encodeURIComponent(params.problemId)}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        });
+        if (res.ok) return { success: true };
+      } catch {}
+      return { success: true };
+    }
+
+    const volUuid = await resolveVolunteerUuid(params.volunteerId);
+
+    const { error } = await supabase.from('actions').insert({
+      problem_id: params.problemId,
+      description: params.description,
+      photo_url: params.photoUrl,
+      photo_type: params.photoType,
+      logged_by: volUuid,
+    });
+
+    if (error) return { success: false, error: error.message };
+
+    // Mirror to local API
+    try {
+      await fetch(`/api/problems/${encodeURIComponent(params.problemId)}/actions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+    } catch {}
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
+/**
+ * Mark a problem as solved with before and after photo proof.
+ * Database trigger `check_solved_photo_requirements` ensures at least 1 'before' and 1 'after' photo exist!
+ */
+export async function resolveProblemInDb(params: {
+  problemId: string;
+  solvedPhotoUrl: string;
+  beforePhotoUrl?: string;
+  impactMetrics?: string;
+  volunteerId?: string | null;
+  volunteerName?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    if (!isSupabaseConfigured()) {
+      try {
+        const res = await fetch(`/api/problems/${encodeURIComponent(params.problemId)}/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        });
+        if (res.ok) {
+          const json = await res.json();
+          return { success: true, ...json };
+        } else {
+          const errJson = await res.json().catch(() => ({}));
+          return { success: false, error: errJson.error || 'Failed to resolve problem' };
+        }
+      } catch (e: any) {
+        return { success: true };
+      }
+    }
+
+    const volUuid = await resolveVolunteerUuid(params.volunteerId);
+
+    // 1. Ensure a 'before' photo exists in actions
+    if (params.beforePhotoUrl) {
+      const { data: existingBefore } = await supabase
+        .from('actions')
+        .select('id')
+        .eq('problem_id', params.problemId)
+        .eq('photo_type', 'before')
+        .limit(1);
+
+      if (!existingBefore || existingBefore.length === 0) {
+        await supabase.from('actions').insert({
+          problem_id: params.problemId,
+          description: 'Initial condition documentation.',
+          photo_url: params.beforePhotoUrl,
+          photo_type: 'before',
+          logged_by: volUuid,
+        });
+      }
+    }
+
+    // 2. Insert the 'after' photo in actions
+    const { error: afterErr } = await supabase.from('actions').insert({
+      problem_id: params.problemId,
+      description: params.impactMetrics || 'Civic drive completed and resolved.',
+      photo_url: params.solvedPhotoUrl,
+      photo_type: 'after',
+      logged_by: volUuid,
+    });
+
+    if (afterErr) {
+      return { success: false, error: afterErr.message };
+    }
+
+    // 3. Update problem status to 'solved' and set resolved_at
+    const nowIso = new Date().toISOString();
+    const { error: updateErr } = await supabase
+      .from('problems')
+      .update({
+        status: 'solved',
+        resolved_at: nowIso,
+      })
+      .eq('id', params.problemId);
+
+    if (updateErr) {
+      return { success: false, error: updateErr.message };
+    }
+
+    // Mirror to local API
+    try {
+      await fetch(`/api/problems/${encodeURIComponent(params.problemId)}/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+    } catch {}
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
+/**
+ * Fetch roster of all volunteers from public.volunteers
+ */
+export async function fetchVolunteersFromDb(): Promise<{ data: ProvisionedVolunteer[]; error: string | null }> {
+  if (!isSupabaseConfigured()) {
+    return { data: [], error: 'Supabase not configured' };
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('volunteers')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) return { data: [], error: error.message };
+
+    const mapped: ProvisionedVolunteer[] = (data || []).map((v: any) => ({
+      id: v.volunteer_id,
+      name: v.name,
+      unit: v.college_unit || 'Ward 4 Youth Wing',
+      role: 'NSS Cadet',
+      email: `${v.volunteer_id.toLowerCase()}@nss.internal`,
+      status: v.status === 'active' ? 'ACTIVE' : 'SUSPENDED',
+      dateProvisioned: new Date(v.created_at).toLocaleDateString(),
+      hoursCompleted: v.hours_completed || 0,
+      civicWins: 0,
+    }));
+
+    return { data: mapped, error: null };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { data: [], error: msg };
+  }
+}
+
+/**
+ * Fetch single volunteer record by auth user id or volunteer_id
+ */
+export async function fetchVolunteerRecord(identifier: string) {
+  try {
+    const query = identifier.includes('-')
+      ? supabase.from('volunteers').select('*').eq('volunteer_id', identifier).single()
+      : supabase.from('volunteers').select('*').eq('id', identifier).single();
+
+    const { data, error } = await query;
+    return { volunteer: data, error: error?.message || null };
+  } catch (err: unknown) {
+    return { volunteer: null, error: String(err) };
+  }
+}
+
+/**
+ * Upvote toggle
+ */
+export async function toggleUpvoteInDb(problemId: string, userId?: string | null, sessionToken?: string): Promise<boolean> {
+  try {
+    const token = sessionToken || (typeof window !== 'undefined' ? localStorage.getItem('nss_session_token') || 'anon-session' : 'anon-session');
+    
+    // Check if upvote exists
+    let query = supabase.from('upvotes').select('id').eq('problem_id', problemId);
+    if (userId) {
+      query = query.eq('community_user_id', userId);
+    } else {
+      query = query.eq('session_token', token);
+    }
+
+    const { data: existing } = await query.limit(1);
+
+    if (existing && existing.length > 0) {
+      // Delete upvote
+      await supabase.from('upvotes').delete().eq('id', existing[0].id);
+      return false;
+    } else {
+      // Insert upvote
+      await supabase.from('upvotes').insert({
+        problem_id: problemId,
+        community_user_id: userId || null,
+        session_token: userId ? null : token,
+      });
+      return true;
+    }
+  } catch (err) {
+    console.error('toggleUpvoteInDb error:', err);
+    return false;
+  }
+}
+
+/**
+ * Adoption toggle
+ */
+export async function toggleAdoptionInDb(problemId: string, userId?: string | null, sessionToken?: string): Promise<boolean> {
+  try {
+    const token = sessionToken || (typeof window !== 'undefined' ? localStorage.getItem('nss_session_token') || 'anon-session' : 'anon-session');
+
+    let query = supabase.from('adoptions').select('id').eq('problem_id', problemId);
+    if (userId) {
+      query = query.eq('community_user_id', userId);
+    } else {
+      query = query.eq('session_token', token);
+    }
+
+    const { data: existing } = await query.limit(1);
+
+    if (existing && existing.length > 0) {
+      await supabase.from('adoptions').delete().eq('id', existing[0].id);
+      return false;
+    } else {
+      await supabase.from('adoptions').insert({
+        problem_id: problemId,
+        community_user_id: userId || null,
+        session_token: userId ? null : token,
+      });
+      return true;
+    }
+  } catch (err) {
+    console.error('toggleAdoptionInDb error:', err);
+    return false;
+  }
+}
